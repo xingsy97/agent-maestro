@@ -3,4 +3,10 @@ export const ANOTHER_INSTANCE_RUNNING_MESSAGE =
 
 export const PORT_MONITOR_INTERVAL_MS = 60_000; // 1 minute
 
+export const USAGE_STATS_PERSIST_INTERVAL_MS = 60_000; // 1 minute
+
+export const USAGE_STATS_FILE_NAME = "usage-stats.json";
+
+export const USAGE_STATS_RETENTION_DAYS = 180;
+
 export const LLM_API_KEY_SECRET_KEY = "agent-maestro.llmApiKey";

@@ -16,6 +16,7 @@ import {
   countAnthropicMessageTokens,
 } from "../utils/anthropic";
 import { handleErrorWithLogging } from "../utils/errorDiagnostics";
+import { UsageStatsCollector, normalizeUserAgent } from "../utils/usageStats";
 
 const prepareAnthropicMessages = async ({
   requestBody,
@@ -184,9 +185,14 @@ export function registerAnthropicRoutes(app: OpenAPIHono) {
   app.openapi(messagesRoute, async (c: Context): Promise<Response> => {
     let effectiveModelId = "";
     let maxInputTokens = 0;
+    let requestedModel = "unknown";
     let rawRequestBody;
     let lmChatMessages: vscode.LanguageModelChatMessage[] | undefined;
     let inputTokens = 0;
+    const requestStartTime = Date.now();
+    const usageStats = c.get("usageStats") as UsageStatsCollector | undefined;
+    const clientName = normalizeUserAgent(c.req.header("user-agent") || "");
+    let isStream = false;
 
     try {
       // Parse request body
@@ -206,6 +212,7 @@ export function registerAnthropicRoutes(app: OpenAPIHono) {
         c.req.header("anthropic-beta"),
       );
 
+      requestedModel = model;
       // 1. Get chat model client (handles model mapping internally)
       const { client: initialClient, error: clientError } =
         await getChatModelClient(resolvedModel);
@@ -232,7 +239,7 @@ export function registerAnthropicRoutes(app: OpenAPIHono) {
       logger.info(
         `→ /v1/messages | model: ${
           model === effectiveModelId ? model : `${model} → ${effectiveModelId}`
-        } | input: ${inputTokenCount.original} → ${inputTokenCount.calibrated} | maxInput: ${maxInputTokens}`,
+        } | input: ${inputTokenCount.original} → ${inputTokenCount.calibrated} | maxInput: ${maxInputTokens} | from: ${c.req.header("x-forwarded-for") || c.req.header("x-real-ip") || "local"} | ua: ${c.req.header("user-agent") || "-"}`,
       );
 
       // 4. Build VS Code Language Model request options
@@ -307,13 +314,25 @@ export function registerAnthropicRoutes(app: OpenAPIHono) {
         logger.debug("/v1/messages response:");
         logger.debug(JSON.stringify(resp, null, 2));
         logger.info(
-          `← /v1/messages | input: ${inputTokenCount.original} → ${inputTokenCount.calibrated} | output: ${outputTokenCount.original} → ${outputTokenCount.calibrated}`,
+          `← /v1/messages | input: ${inputTokenCount.original} → ${inputTokenCount.calibrated} | output: ${outputTokenCount.original} → ${outputTokenCount.calibrated} | duration: ${((Date.now() - requestStartTime) / 1000).toFixed(1)}s`,
         );
+
+        usageStats?.recordUsage({
+          model: effectiveModelId,
+          protocol: "anthropic",
+          endpoint: "/v1/messages",
+          stream: false,
+          inputTokens: inputTokenCount.calibrated,
+          outputTokens: outputTokenCount.calibrated,
+          durationMs: Date.now() - requestStartTime,
+          client: clientName,
+        });
 
         return c.json(resp);
       }
 
       // 7. If streaming, pipe chunks as SSE
+      isStream = true;
       return streamSSE(
         c,
         async (stream) => {
@@ -461,8 +480,19 @@ export function registerAnthropicRoutes(app: OpenAPIHono) {
           await writeSSE({ type: "message_stop" });
 
           logger.info(
-            `← /v1/messages (stream) | input: ${inputTokenCount.original} → ${inputTokenCount.calibrated} | output: ${outputTokenCount.original} → ${outputTokenCount.calibrated}`,
+            `← /v1/messages (stream) | input: ${inputTokenCount.original} → ${inputTokenCount.calibrated} | output: ${outputTokenCount.original} → ${outputTokenCount.calibrated} | duration: ${((Date.now() - requestStartTime) / 1000).toFixed(1)}s`,
           );
+
+          usageStats?.recordUsage({
+            model: effectiveModelId,
+            protocol: "anthropic",
+            endpoint: "/v1/messages",
+            stream: true,
+            inputTokens: inputTokenCount.calibrated,
+            outputTokens: outputTokenCount.calibrated,
+            durationMs: Date.now() - requestStartTime,
+            client: clientName,
+          });
         },
         async (error, _stream) => {
           logger.error("✕ /v1/messages |", error);
@@ -470,6 +500,18 @@ export function registerAnthropicRoutes(app: OpenAPIHono) {
       );
     } catch (error) {
       logger.error("✕ /v1/messages |", error);
+
+      usageStats?.recordUsage({
+        model: effectiveModelId || requestedModel,
+        protocol: "anthropic",
+        endpoint: "/v1/messages",
+        stream: isStream,
+        inputTokens,
+        outputTokens: 0,
+        durationMs: Date.now() - requestStartTime,
+        error: true,
+        client: clientName,
+      });
 
       const logFilePath = await handleErrorWithLogging({
         requestBody: rawRequestBody,

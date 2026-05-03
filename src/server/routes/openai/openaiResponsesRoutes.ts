@@ -22,6 +22,7 @@ import {
   generateResponseId,
   getCurrentTimestamp,
 } from "../../utils/openaiResponses";
+import { UsageStatsCollector, normalizeUserAgent } from "../../utils/usageStats";
 
 type NonStreamingResponse = Omit<
   OpenAI.Responses.Response,
@@ -115,6 +116,11 @@ export function registerOpenaiResponsesRoutes(app: OpenAPIHono) {
     let lmChatMessages: vscode.LanguageModelChatMessage[] | undefined;
     let requestedModelId = "";
     let inputTokens = 0;
+    const requestStartTime = Date.now();
+    const usageStats = c.get("usageStats") as UsageStatsCollector | undefined;
+    const clientName = normalizeUserAgent(c.req.header("user-agent") || "");
+    let isStream = false;
+    let resolvedModelId = "";
 
     try {
       // 1. Parse request and extract fields
@@ -222,20 +228,26 @@ export function registerOpenaiResponsesRoutes(app: OpenAPIHono) {
         return c.json(clientError, 404);
       }
 
+      resolvedModelId = client.id;
+
       // 5. Count input tokens
       logger.debug("/v1/responses payload:");
       logger.debug(JSON.stringify(requestBody, null, 2));
       const cancellationTokenSource = new vscode.CancellationTokenSource();
       const cancellationToken = cancellationTokenSource.token;
-      inputTokens = await client.countTokens(
-        JSON.stringify(requestBody),
-        cancellationToken,
-      );
+      try {
+        inputTokens = await client.countTokens(
+          JSON.stringify(requestBody),
+          cancellationToken,
+        );
+      } catch (tokenErr) {
+        logger.warn(`⚠ /v1/responses | countTokens failed:`, tokenErr);
+      }
 
       logger.info(
         `→ /v1/responses | model: ${
           model === client.id ? model : `${model} → ${client.id}`
-        } | input: ${inputTokens}`,
+        } | input: ${inputTokens} | from: ${c.req.header("x-forwarded-for") || c.req.header("x-real-ip") || "local"} | ua: ${c.req.header("user-agent") || "-"}`,
       );
 
       // 6. Convert input to VSCode messages
@@ -315,14 +327,26 @@ export function registerOpenaiResponsesRoutes(app: OpenAPIHono) {
         logger.debug("/v1/responses response:");
         logger.debug(JSON.stringify(responseObj, null, 2));
         logger.info(
-          `← /v1/responses | input: ${inputTokens} | output: ${outputTokens}`,
+          `← /v1/responses | input: ${inputTokens} | output: ${outputTokens} | duration: ${((Date.now() - requestStartTime) / 1000).toFixed(1)}s`,
         );
+
+        usageStats?.recordUsage({
+          model: resolvedModelId,
+          protocol: "openai",
+          endpoint: "/v1/responses",
+          stream: false,
+          inputTokens,
+          outputTokens,
+          durationMs: Date.now() - requestStartTime,
+          client: clientName,
+        });
 
         cancellationTokenSource.dispose();
         return c.json(responseObj);
       }
 
       // 10. Handle streaming response
+      isStream = true;
       return streamSSE(
         c,
         async (sseStream) => {
@@ -569,8 +593,19 @@ export function registerOpenaiResponsesRoutes(app: OpenAPIHono) {
           });
 
           logger.info(
-            `← /v1/responses (stream) | input: ${inputTokens} | output: ${outputTokens}`,
+            `← /v1/responses (stream) | input: ${inputTokens} | output: ${outputTokens} | duration: ${((Date.now() - requestStartTime) / 1000).toFixed(1)}s`,
           );
+
+          usageStats?.recordUsage({
+            model: resolvedModelId,
+            protocol: "openai",
+            endpoint: "/v1/responses",
+            stream: true,
+            inputTokens,
+            outputTokens,
+            durationMs: Date.now() - requestStartTime,
+            client: clientName,
+          });
         },
         async (error, sseStream) => {
           logger.error("✕ /v1/responses (stream) |", error);
@@ -605,6 +640,18 @@ export function registerOpenaiResponsesRoutes(app: OpenAPIHono) {
       );
     } catch (error) {
       logger.error("✕ /v1/responses |", error);
+
+      usageStats?.recordUsage({
+        model: resolvedModelId || requestedModelId,
+        protocol: "openai",
+        endpoint: "/v1/responses",
+        stream: isStream,
+        inputTokens,
+        outputTokens: 0,
+        durationMs: Date.now() - requestStartTime,
+        error: true,
+        client: clientName,
+      });
 
       const logFilePath = await handleErrorWithLogging({
         requestBody: rawRequestBody,

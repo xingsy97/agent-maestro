@@ -18,6 +18,7 @@ import {
   convertGeminiToolConfigToVSCode,
   convertGeminiToolsToVSCode,
 } from "../utils/gemini";
+import { UsageStatsCollector, normalizeUserAgent } from "../utils/usageStats";
 
 // ============================================================================
 // Shared Helper Functions
@@ -51,10 +52,15 @@ const prepareGeminiRequest = async ({
   // a misuse since it's designed for LanguageModelChatMessage objects. However, we intentionally
   // do this to leverage the official tokenizer instead of building our own wheel.
   const cancellationToken = new vscode.CancellationTokenSource().token;
-  const inputTokenCount = await client.countTokens(
-    JSON.stringify(requestBody),
-    cancellationToken,
-  );
+  let inputTokenCount = 0;
+  try {
+    inputTokenCount = await client.countTokens(
+      JSON.stringify(requestBody),
+      cancellationToken,
+    );
+  } catch (tokenErr) {
+    logger.warn(`⚠ Gemini | countTokens failed:`, tokenErr);
+  }
 
   // Build request options
   const lmRequestOptions: vscode.LanguageModelChatRequestOptions = {
@@ -294,6 +300,10 @@ export function registerGeminiRoutes(app: OpenAPIHono) {
     let lmChatMessages: vscode.LanguageModelChatMessage[] | undefined;
     let modelId = "";
     let inputTokens = 0;
+    const requestStartTime = Date.now();
+    const usageStats = c.get("usageStats") as UsageStatsCollector | undefined;
+    const clientName = normalizeUserAgent(c.req.header("user-agent") || "");
+    let resolvedModelId = "";
 
     try {
       // Parse request
@@ -327,11 +337,12 @@ export function registerGeminiRoutes(app: OpenAPIHono) {
       } = await prepareGeminiRequest({ requestBody, client });
       lmChatMessages = vsCodeLmMessages;
       inputTokens = inputTokenCount;
+      resolvedModelId = client.id;
 
       logger.info(
         `→ /v1beta/models/${modelWithMethod} | model: ${
           modelId === client.id ? modelId : `${modelId} → ${client.id}`
-        } | input: ${inputTokenCount}`,
+        } | input: ${inputTokenCount} | from: ${c.req.header("x-forwarded-for") || c.req.header("x-real-ip") || "local"} | ua: ${c.req.header("user-agent") || "-"}`,
       );
 
       // 3. Send request to VSCode LM API
@@ -390,12 +401,35 @@ export function registerGeminiRoutes(app: OpenAPIHono) {
       logger.debug("generateContent response:");
       logger.debug(JSON.stringify(geminiResponse, null, 2));
       logger.info(
-        `← /v1beta/models/${modelWithMethod} | input: ${inputTokenCount} | output: ${outputTokenCount}`,
+        `← /v1beta/models/${modelWithMethod} | input: ${inputTokenCount} | output: ${outputTokenCount} | duration: ${((Date.now() - requestStartTime) / 1000).toFixed(1)}s`,
       );
+
+      usageStats?.recordUsage({
+        model: resolvedModelId,
+        protocol: "gemini",
+        endpoint: "/v1beta/models/:model:generateContent",
+        stream: false,
+        inputTokens: inputTokenCount,
+        outputTokens: outputTokenCount,
+        durationMs: Date.now() - requestStartTime,
+        client: clientName,
+      });
 
       return c.json(geminiResponse, 200);
     } catch (error) {
       logger.error(`✕ /v1beta/models/${modelId}:generateContent |`, error);
+
+      usageStats?.recordUsage({
+        model: resolvedModelId || modelId,
+        protocol: "gemini",
+        endpoint: "/v1beta/models/:model:generateContent",
+        stream: false,
+        inputTokens,
+        outputTokens: 0,
+        durationMs: Date.now() - requestStartTime,
+        error: true,
+        client: clientName,
+      });
 
       const logFilePath = await handleErrorWithLogging({
         requestBody: rawRequestBody,
@@ -429,6 +463,12 @@ export function registerGeminiRoutes(app: OpenAPIHono) {
       let lmChatMessages: vscode.LanguageModelChatMessage[] | undefined;
       let modelId = "";
       let inputTokens = 0;
+      const requestStartTime = Date.now();
+      const usageStats = c.get("usageStats") as
+        | UsageStatsCollector
+        | undefined;
+      let resolvedModelId = "";
+      const clientName = normalizeUserAgent(c.req.header("user-agent") || "");
 
       try {
         // Parse request
@@ -463,11 +503,12 @@ export function registerGeminiRoutes(app: OpenAPIHono) {
         } = await prepareGeminiRequest({ requestBody, client });
         lmChatMessages = vsCodeLmMessages;
         inputTokens = inputTokenCount;
+        resolvedModelId = client.id;
 
         logger.info(
           `→ /v1beta/models/${modelWithMethod} | model: ${
             modelId === client.id ? modelId : `${modelId} → ${client.id}`
-          } | input: ${inputTokenCount}`,
+          } | input: ${inputTokenCount} | from: ${c.req.header("x-forwarded-for") || c.req.header("x-real-ip") || "local"} | ua: ${c.req.header("user-agent") || "-"}`,
         );
 
         // 3. Send request to VSCode LM API
@@ -559,8 +600,19 @@ export function registerGeminiRoutes(app: OpenAPIHono) {
             });
 
             logger.info(
-              `← /v1beta/models/${modelWithMethod} (stream) | input: ${inputTokenCount} | output: ${outputTokenCount}`,
+              `← /v1beta/models/${modelWithMethod} (stream) | input: ${inputTokenCount} | output: ${outputTokenCount} | duration: ${((Date.now() - requestStartTime) / 1000).toFixed(1)}s`,
             );
+
+            usageStats?.recordUsage({
+              model: resolvedModelId,
+              protocol: "gemini",
+              endpoint: "/v1beta/models/:model:streamGenerateContent",
+              stream: true,
+              inputTokens: inputTokenCount,
+              outputTokens: outputTokenCount,
+              durationMs: Date.now() - requestStartTime,
+              client: clientName,
+            });
           },
           async (error, stream) => {
             logger.error(
@@ -602,6 +654,18 @@ export function registerGeminiRoutes(app: OpenAPIHono) {
           `✕ /v1beta/models/${modelId}:streamGenerateContent |`,
           error,
         );
+
+        usageStats?.recordUsage({
+          model: resolvedModelId || modelId,
+          protocol: "gemini",
+          endpoint: "/v1beta/models/:model:streamGenerateContent",
+          stream: true,
+          inputTokens,
+          outputTokens: 0,
+          durationMs: Date.now() - requestStartTime,
+          error: true,
+          client: clientName,
+        });
 
         const logFilePath = await handleErrorWithLogging({
           requestBody: rawRequestBody,

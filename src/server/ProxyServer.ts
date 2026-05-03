@@ -24,12 +24,21 @@ import { registerFsRoutes } from "./routes/fsRoutes";
 import { registerGeminiRoutes } from "./routes/geminiRoutes";
 import { registerInfoRoutes } from "./routes/infoRoutes";
 import { registerLmRoutes } from "./routes/lmRoutes";
+import { registerMetricsRoute } from "./routes/metricsRoutes";
 import { registerOpenaiRoutes } from "./routes/openai/openaiRoutes";
 import { registerRooRoutes } from "./routes/rooRoutes";
 import { registerWorkspaceRoutes } from "./routes/workspaceRoutes";
+import { UsageStatsCollector } from "./utils/usageStats";
+import { UsageStatsPersistence } from "./utils/usageStatsPersistence";
+
+export type AppEnv = {
+  Variables: {
+    usageStats: UsageStatsCollector;
+  };
+};
 
 export class ProxyServer {
-  private app: OpenAPIHono;
+  private app: OpenAPIHono<AppEnv>;
   private controller: ExtensionController;
   private context: vscode.ExtensionContext;
   private isRunning = false;
@@ -37,6 +46,8 @@ export class ProxyServer {
   private server?: ServerType;
   private portMonitorInterval?: NodeJS.Timeout;
   private llmApiKey: string | null = null;
+  private usageStats: UsageStatsCollector;
+  private usageStatsPersistence: UsageStatsPersistence;
 
   constructor(
     controller: ExtensionController,
@@ -46,13 +57,19 @@ export class ProxyServer {
     this.controller = controller;
     this.context = context;
     this.port = port;
+    this.usageStats = new UsageStatsCollector();
+    this.usageStatsPersistence = new UsageStatsPersistence(
+      this.context.globalStorageUri,
+      this.usageStats,
+    );
 
     // Initialize OpenAPIHono app with basic middleware
-    this.app = new OpenAPIHono();
+    this.app = new OpenAPIHono<AppEnv>();
     this.app.use(cors());
     this.app.use(compress());
     this.app.use("*", async (c, next) => {
       logger.debug(`Incoming request: ${c.req.method} ${c.req.url}`);
+      c.set("usageStats", this.usageStats);
       await next();
     });
 
@@ -69,6 +86,11 @@ export class ProxyServer {
       "/api/gemini/*",
       createGeminiAuthMiddleware(this.getLlmApiKey.bind(this)),
     );
+
+    // Register Prometheus metrics endpoint (no auth required)
+    const extensionVersion =
+      this.context.extension?.packageJSON?.version ?? "unknown";
+    registerMetricsRoute(this.app, this.usageStats, extensionVersion);
 
     // Register routes under the /api/v1 namespace
     this.app.route("/api/v1", this.getApiV1Routes());
@@ -201,6 +223,7 @@ export class ProxyServer {
             port: this.port,
           });
           this.isRunning = true;
+          this.startUsageStatsPersistence();
           logger.info(`Server started on http://0.0.0.0:${this.port}`);
           logger.info(
             `API documentation: http://0.0.0.0:${this.port}/openapi.json`,
@@ -311,6 +334,9 @@ export class ProxyServer {
         this.stopPortMonitoring();
 
         try {
+          // Re-load latest stats from file before taking over,
+          // since the previous active instance may have written newer data.
+          await this.restoreUsageStats();
           await this.start();
         } catch (error) {
           logger.error("Failed to start proxy server after monitoring:", error);
@@ -366,5 +392,41 @@ export class ProxyServer {
         error,
       );
     }
+  }
+
+  /**
+   * Restores usage stats from persistent storage.
+   * Periodic saving is NOT started here — it is started only when the
+   * server actually binds the port (in start()), so standby instances
+   * don't overwrite the active instance's data.
+   */
+  async restoreUsageStats(): Promise<void> {
+    await this.usageStatsPersistence.restore();
+  }
+
+  /**
+   * Starts periodic usage stats persistence.
+   * Should only be called when this instance owns the port.
+   */
+  private startUsageStatsPersistence(): void {
+    this.usageStatsPersistence.start();
+  }
+
+  /**
+   * Persists current usage stats to storage.
+   * Uses read-merge-write to prevent counter regression when multiple
+   * VSCode windows share the same persistence file.
+   * Called periodically and on extension deactivation.
+   */
+  async persistUsageStats(): Promise<void> {
+    await this.usageStatsPersistence.persist();
+  }
+
+  /**
+   * Stops periodic usage stats persistence and performs a final save.
+   * Should be called during extension deactivation.
+   */
+  async stopUsageStatsPersistence(): Promise<void> {
+    await this.usageStatsPersistence.stop();
   }
 }

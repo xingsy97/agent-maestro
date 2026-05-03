@@ -12,6 +12,7 @@ import {
   convertOpenAIChatCompletionToolToVSCode,
   convertOpenAIMessagesToVSCode,
 } from "../../utils/openaiChat";
+import { UsageStatsCollector, normalizeUserAgent } from "../../utils/usageStats";
 
 // OpenAPI route definition for /v1/chat/completions
 const chatCompletionsRoute = createRoute({
@@ -92,6 +93,11 @@ export function registerOpenaiChatRoutes(app: OpenAPIHono) {
     let lmChatMessages: vscode.LanguageModelChatMessage[] | undefined;
     let requestedModelId = "";
     let inputTokens = 0;
+    const requestStartTime = Date.now();
+    const usageStats = c.get("usageStats") as UsageStatsCollector | undefined;
+    const clientName = normalizeUserAgent(c.req.header("user-agent") || "");
+    let isStream = false;
+    let resolvedModelId = "";
 
     try {
       // Parse and validate request body
@@ -116,6 +122,8 @@ export function registerOpenaiChatRoutes(app: OpenAPIHono) {
         return c.json(clientError, 404);
       }
 
+      resolvedModelId = client.id;
+
       // NOTE: Rough estimation of input tokens for OpenAI API
       // We pass the stringified request body to VSCode's countTokens() API, which is technically
       // a misuse since it's designed for LanguageModelChatMessage objects. However, we intentionally
@@ -123,16 +131,21 @@ export function registerOpenaiChatRoutes(app: OpenAPIHono) {
       logger.debug("/v1/chat/completions payload:");
       logger.debug(JSON.stringify(requestBody, null, 2));
       const cancellationToken = new vscode.CancellationTokenSource().token;
-      const inputTokenCount = await client.countTokens(
-        JSON.stringify(requestBody),
-        cancellationToken,
-      );
+      let inputTokenCount = 0;
+      try {
+        inputTokenCount = await client.countTokens(
+          JSON.stringify(requestBody),
+          cancellationToken,
+        );
+      } catch (tokenErr) {
+        logger.warn(`⚠ /v1/chat/completions | countTokens failed:`, tokenErr);
+      }
       inputTokens = inputTokenCount;
 
       logger.info(
         `→ /v1/chat/completions | model: ${
           modelId === client.id ? modelId : `${modelId} → ${client.id}`
-        } | input: ${inputTokenCount}`,
+        } | input: ${inputTokenCount} | from: ${c.req.header("x-forwarded-for") || c.req.header("x-real-ip") || "local"} | ua: ${c.req.header("user-agent") || "-"}`,
       );
 
       // 2. Convert OpenAI messages to VSCode LM format
@@ -213,13 +226,25 @@ export function registerOpenaiChatRoutes(app: OpenAPIHono) {
         logger.debug("/v1/chat/completions response:");
         logger.debug(JSON.stringify(openaiResponse, null, 2));
         logger.info(
-          `← /v1/chat/completions | input: ${inputTokenCount} | output: ${completionTokens}`,
+          `← /v1/chat/completions | input: ${inputTokenCount} | output: ${completionTokens} | duration: ${((Date.now() - requestStartTime) / 1000).toFixed(1)}s`,
         );
+
+        usageStats?.recordUsage({
+          model: resolvedModelId,
+          protocol: "openai",
+          endpoint: "/v1/chat/completions",
+          stream: false,
+          inputTokens: inputTokenCount,
+          outputTokens: completionTokens,
+          durationMs: Date.now() - requestStartTime,
+          client: clientName,
+        });
 
         return c.json(openaiResponse);
       }
 
       // 6. If streaming, pipe chunks as SSE
+      isStream = true;
       return streamSSE(
         c,
         async (stream) => {
@@ -347,8 +372,19 @@ export function registerOpenaiChatRoutes(app: OpenAPIHono) {
           });
 
           logger.info(
-            `← /v1/chat/completions (stream) | input: ${inputTokenCount} | output: ${usage?.completion_tokens ?? 0}`,
+            `← /v1/chat/completions (stream) | input: ${inputTokenCount} | output: ${usage?.completion_tokens ?? 0} | duration: ${((Date.now() - requestStartTime) / 1000).toFixed(1)}s`,
           );
+
+          usageStats?.recordUsage({
+            model: resolvedModelId,
+            protocol: "openai",
+            endpoint: "/v1/chat/completions",
+            stream: true,
+            inputTokens: inputTokenCount,
+            outputTokens: usage?.completion_tokens ?? 0,
+            durationMs: Date.now() - requestStartTime,
+            client: clientName,
+          });
         },
         async (error, stream) => {
           logger.error("✕ /v1/chat/completions (stream) |", error);
@@ -379,6 +415,18 @@ export function registerOpenaiChatRoutes(app: OpenAPIHono) {
       );
     } catch (error) {
       logger.error("✕ /v1/chat/completions |", error);
+
+      usageStats?.recordUsage({
+        model: resolvedModelId || requestedModelId,
+        protocol: "openai",
+        endpoint: "/v1/chat/completions",
+        stream: isStream,
+        inputTokens,
+        outputTokens: 0,
+        durationMs: Date.now() - requestStartTime,
+        error: true,
+        client: clientName,
+      });
 
       const logFilePath = await handleErrorWithLogging({
         requestBody: rawRequestBody,

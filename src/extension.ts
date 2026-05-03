@@ -57,6 +57,9 @@ export async function activate(context: vscode.ExtensionContext) {
   // Restore LLM API key from secrets storage
   await proxy.restoreLlmApiKey();
 
+  // Restore usage stats from persistent storage and start periodic saving
+  await proxy.restoreUsageStats();
+
   // Register all commands
   registerAllCommands(context, controller, proxy, mcpServer);
 
@@ -69,6 +72,10 @@ export async function activate(context: vscode.ExtensionContext) {
 // This method is called when your extension is deactivated
 export async function deactivate() {
   try {
+    if (proxy) {
+      await proxy.stopUsageStatsPersistence();
+      logger.info("Usage stats persisted");
+    }
     if (mcpServer) {
       await mcpServer.stop();
       logger.info("MCP server stopped");
